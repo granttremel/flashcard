@@ -4,7 +4,7 @@ from flashcard.edit import FlashcardEditor
 
 from pprint import pprint
 
-fcpath = r"~/Documents/flashcards_short.ods"
+fcpath = r"./data/flashcards.ods"
 
 sn = 'anatomy'
 
