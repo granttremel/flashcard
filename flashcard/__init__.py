@@ -4,6 +4,7 @@ from typing import Dict, List, Set, Optional, Tuple
 from dataclasses import dataclass, field
 from pathlib import Path
 from .config import DomainConfig, ANATOMY_CONFIG
+from .symbol_normalization import SymbolNormalizer, create_symbol_index
 
 class Flashcard:
     
@@ -40,6 +41,14 @@ class Flashcard:
             if not self.data.get(field, []):
                 return False
         return True
+    
+    def get_incomplete_fields(self) -> List[str]:
+        """Get list of required fields that are not filled"""
+        incomplete = []
+        for field in self.domain.required_fields:
+            if not self.data.get(field, []):
+                incomplete.append(field)
+        return incomplete
     
     def get_all_fields(self) -> Dict[str, List[str]]:
         """Get both standard and custom fields"""
@@ -84,6 +93,8 @@ class FlashcardCollection:
             # 'process': PROCESS_CONFIG
         }
         self.domain_members: Dict[str, Set[str]] = {name: set() for name in self.domains}
+        self.symbol_normalizer = SymbolNormalizer()
+        self.symbol_index = None  # Will be populated after loading
     
     def add_domain(self, config: DomainConfig):
         """Add a new concept domain configuration"""
@@ -99,6 +110,10 @@ class FlashcardCollection:
         self.cards[concept] = card
         self.domain_members[domain_name].add(concept)
         return card
+    
+    def get_card(self, concept: str) -> Optional[Flashcard]:
+        """Get a card by concept name"""
+        return self.cards.get(concept)
     
     
     def load_from_excel(self, filepath: str, domain_name: str, sheet_name: Optional[str] = None):
@@ -120,40 +135,91 @@ class FlashcardCollection:
             for col in df.columns:
                 card.add_field(col, row[col])
         
-        # Auto-link after loading
+        # Create symbol index and auto-link after loading
+        self.symbol_index = create_symbol_index(self)
         self._auto_link_cards()
     
     def _auto_link_cards(self):
-        """Create cross-domain links based on field values"""
+        """Create links based on field values and names"""
+        print("Auto-linking cards...")
+        
         for concept, card in self.cards.items():
             # Check all fields for potential links
             for field_name, values in card.get_all_fields().items():
-                # Look for link-type indicators in field names
-                field_lower = field_name.lower()
+                field_lower = field_name.lower().replace(' ', '').replace('_', '')
                 
-                # Cross-domain linking rules
-                if 'patholog' in field_lower:
-                    for value in values:
-                        if value in self.cards:
-                            card.add_link('related_pathology', value)
-                            self.cards[value].add_link('pathology_of', concept)
+                # Create mapping from field names to link types
+                link_mappings = {
+                    'superstructure': 'Superstructure',
+                    'superstructures': 'Superstructure', 
+                    'substructure': 'Substructure',
+                    'substructures': 'Substructure',
+                    'superclass': 'Superclass',
+                    'subclass': 'Subclass',
+                    'localizedwith': 'Localized with',
+                    'developsfrom': 'Develops from',
+                    'relatedpathology': 'Related Pathology',
+                    'relatedpathologies': 'Related Pathology',
+                    'involvedin': 'Involved in',
+                    'patholog': 'Related Pathology',  # Catch variations
+                    'process': 'Involved in'
+                }
                 
-                elif 'process' in field_lower or 'participates' in field_lower:
-                    for value in values:
-                        if value in self.cards:
-                            card.add_link('participates_in_process', value)
-                            self.cards[value].add_link('has_participant', concept)
-                
-                # Standard within-domain links
-                for link_type in card.links:
-                    if link_type in field_lower:
+                # Check if this field maps to a known link type
+                for pattern, link_type in link_mappings.items():
+                    if pattern in field_lower:
+                        # Add links for each value that matches an existing card
                         for value in values:
-                            if value in self.cards:
-                                card.add_link(link_type, value)
+                            linked = self._try_link_value(card, link_type, value, concept)
+                            if not linked:
+                                # Try with symbol normalization
+                                suggestion = self.symbol_normalizer.suggest_normalization(
+                                    value, set(self.cards.keys())
+                                )
+                                if suggestion['exact_match']:
+                                    card.add_link(link_type, suggestion['exact_match'])
+                                    print(f"  Linked {concept} --{link_type}--> {suggestion['exact_match']} (normalized)")
+                                elif suggestion['similar'] and suggestion['similar'][0][1] > 0.8:
+                                    # High confidence match
+                                    best_match = suggestion['similar'][0][0]
+                                    card.add_link(link_type, best_match)
+                                    print(f"  Linked {concept} --{link_type}--> {best_match} (fuzzy: {suggestion['similar'][0][1]:.2f})")
+                        break  # Only match first pattern to avoid duplicates
+        
+        # Print summary
+        total_links = sum(len(links) for card in self.cards.values() for links in card.links.values())
+        print(f"Auto-linking complete. Created {total_links} total links.")
+    
+    def _try_link_value(self, card, link_type: str, value: str, concept: str) -> bool:
+        """Try to link a value to an existing card. Returns True if successful."""
+        clean_value = value.strip()
+        
+        # Try exact match first
+        if clean_value in self.cards:
+            card.add_link(link_type, clean_value)
+            print(f"  Linked {concept} --{link_type}--> {clean_value}")
+            return True
+        
+        # Try case-insensitive match
+        for card_name in self.cards.keys():
+            if card_name.lower() == clean_value.lower():
+                card.add_link(link_type, card_name)
+                print(f"  Linked {concept} --{link_type}--> {card_name} (case-insensitive)")
+                return True
+        
+        return False
     
     def get_cards_by_domain(self, domain_name: str) -> List[Flashcard]:
         """Get all cards of a specific domain"""
         return [self.cards[concept] for concept in self.domain_members.get(domain_name, set())]
+    
+    def get_incomplete_cards(self, domain_name: str = None) -> List[Flashcard]:
+        """Get all incomplete cards, optionally filtered by domain"""
+        if domain_name:
+            cards = self.get_cards_by_domain(domain_name)
+        else:
+            cards = list(self.cards.values())
+        return [card for card in cards if not card.is_complete()]
     
     def get_cross_domain_links(self, concept: str) -> Dict[str, List[tuple]]:
         """Get all links that cross domain boundaries"""
