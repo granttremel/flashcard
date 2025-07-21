@@ -3,55 +3,56 @@ import json
 from typing import Dict, List, Set, Optional, Tuple
 from dataclasses import dataclass, field
 from pathlib import Path
+from .config import DomainConfig, ANATOMY_CONFIG
 
-
-@dataclass
 class Flashcard:
-    """Represents a single flashcard with multiple fields and linkages"""
-    concept: str
-    fields: Dict[str, List[str]] = field(default_factory=dict)
-    links: Dict[str, Set[str]] = field(default_factory=dict)  # link_type -> set of linked concepts
     
+    def __init__(self, concept: str, domain: DomainConfig):
+        self.concept = concept
+        self.domain = domain
+        self.data: Dict[str, List[str]] = {field: [] for field in domain.data_fields}
+        self.links: Dict[str, Set[str]] = {link_type: set() for link_type in domain.link_types}
+        self.custom_fields: Dict[str, List[str]] = {}  # For ad-hoc fields
+        
     def add_field(self, field_name: str, values: str):
-        """Add field values, splitting by semicolon"""
+        """Add values to a field (standard or custom)"""
         if pd.isna(values) or values == '':
-            self.fields[field_name] = []
+            return
+            
+        value_list = [v.strip() for v in str(values).split(';') if v.strip()]
+        
+        if field_name in self.data:
+            self.data[field_name] = value_list
         else:
-            self.fields[field_name] = [v.strip() for v in str(values).split(';') if v.strip()]
+            # Handle as custom field
+            self.custom_fields[field_name] = value_list
     
     def add_link(self, link_type: str, target_concept: str):
-        """Add a link to another concept"""
+        """Add a link of specified type"""
         if link_type not in self.links:
+            # Allow custom link types too
             self.links[link_type] = set()
         self.links[link_type].add(target_concept)
     
-    def get_field_values(self, field_name: str) -> List[str]:
-        """Get all values for a specific field"""
-        return self.fields.get(field_name, [])
-    
     def is_complete(self) -> bool:
-        """Check if all fields have at least one value"""
-        return all(len(values) > 0 for values in self.fields.values())
+        """Check if all required fields are filled"""
+        for field in self.domain.required_fields:
+            if not self.data.get(field, []):
+                return False
+        return True
     
-    def get_incomplete_fields(self) -> List[str]:
-        """Return list of fields that are empty"""
-        return [field for field, values in self.fields.items() if len(values) == 0]
+    def get_all_fields(self) -> Dict[str, List[str]]:
+        """Get both standard and custom fields"""
+        return {**self.data, **self.custom_fields}
     
     def to_dict(self) -> dict:
-        """Convert to dictionary for serialization"""
         return {
             'concept': self.concept,
-            'fields': self.fields,
+            'domain': self.domain.name,
+            'data': self.data,
+            'custom_fields': self.custom_fields,
             'links': {k: list(v) for k, v in self.links.items()}
         }
-    
-    @classmethod
-    def from_dict(cls, data: dict) -> 'Flashcard':
-        """Create from dictionary"""
-        card = cls(concept=data['concept'])
-        card.fields = data['fields']
-        card.links = {k: set(v) for k, v in data.get('links', {}).items()}
-        return card
 
     def __str__(self):
         
@@ -59,121 +60,133 @@ class Flashcard:
         topstr = f'Concept: {self.concept}'
         outstrs = [topstr]
         
-        for ff in self.fields:
-            fielditems = '; '.join(self.fields[ff])
-            outstrs.append(f'{ff}: {fielditems}')
-            print(f'did {ff}')
+        dcts = [self.data, self.links, self.custom_fields]
+        
+        for dct in dcts:
+            for ff in dct:
+                vv = dct[ff]
+                if len(vv) > 0:
+                    fielditems = '; '.join(vv)
+                    outstrs.append(f'{ff}: {fielditems}')
+
         return '\n\t'.join(outstrs)
+    
+    
         
 class FlashcardCollection:
-    """Manages a collection of flashcards with automatic linking"""
+    """Collection that can handle multiple concept domains"""
     
     def __init__(self):
         self.cards: Dict[str, Flashcard] = {}
-        self.field_names: Set[str] = set()
-        self.link_types: Set[str] = {'Superstructure', 'Superclass', 'Substructure', 'Subclass','Link'}
+        self.domains: Dict[str, DomainConfig] = {
+            'anatomy': ANATOMY_CONFIG,
+            # 'pathology': PATHOLOGY_CONFIG,
+            # 'process': PROCESS_CONFIG
+        }
+        self.domain_members: Dict[str, Set[str]] = {name: set() for name in self.domains}
     
-    def load_from_excel(self, filepath: str, sheet_name: Optional[str] = None):
-        """Load flashcards from Excel/ODS file"""
-        
-        dfs = pd.read_excel(filepath, sheet_name=sheet_name)
-
-        if sheet_name:
-            df = dfs
-        else:
-            sns = list(dfs.keys())
-            sheet_name = sns[0]
-            df = dfs[sheet_name]
-            print(f"no sheet name provided, defaulting to {sheet_name} out of {sns}")
+    def add_domain(self, config: DomainConfig):
+        """Add a new concept domain configuration"""
+        self.domains[config.name] = config
+        self.domain_members[config.name] = set()
+    
+    def create_card(self, concept: str, domain_name: str) -> Flashcard:
+        """Create a new card of specified domain"""
+        if domain_name not in self.domains:
+            raise ValueError(f"Unknown domain: {domain_name}")
             
-        # Store field names (column headers)
-        self.field_names = set(df.columns)
+        card = Flashcard(concept, self.domains[domain_name])
+        self.cards[concept] = card
+        self.domain_members[domain_name].add(concept)
+        return card
+    
+    
+    def load_from_excel(self, filepath: str, domain_name: str, sheet_name: Optional[str] = None):
+        """Load cards from Excel, treating them as specified domain"""
+        if domain_name not in self.domains:
+            raise ValueError(f"Unknown domain: {domain_name}")
+            
+        df = pd.read_excel(filepath, sheet_name=sheet_name)
+        domain_config = self.domains[domain_name]
         
-        # Create flashcards from rows
         for _, row in df.iterrows():
-            # Assume first column is the concept name
             concept_name = str(row.iloc[0]) if not pd.isna(row.iloc[0]) else None
             if not concept_name:
                 continue
                 
-            card = Flashcard(concept=concept_name)
+            card = self.create_card(concept_name, domain_name)
             
-            # Add all fields
+            # Add all fields from the spreadsheet
             for col in df.columns:
                 card.add_field(col, row[col])
-            
-            self.cards[concept_name] = card
         
-        # Auto-link cards based on shared symbols
+        # Auto-link after loading
         self._auto_link_cards()
     
     def _auto_link_cards(self):
-        """Automatically create links between cards based on shared symbols"""
-        # First, build an index of all symbols to concepts
-        symbol_to_concepts: Dict[str, Set[str]] = {}
-        
+        """Create cross-domain links based on field values"""
         for concept, card in self.cards.items():
-            # Check each field for potential symbols
-            for field_name, values in card.fields.items():
-                # Look for link-type fields
-                if any(link_type in field_name.lower() for link_type in self.link_types):
+            # Check all fields for potential links
+            for field_name, values in card.get_all_fields().items():
+                # Look for link-type indicators in field names
+                field_lower = field_name.lower()
+                
+                # Cross-domain linking rules
+                if 'patholog' in field_lower:
                     for value in values:
-                        if value in self.cards:  # If the value is another concept
-                            # Determine link type from field name
-                            for link_type in self.link_types:
-                                if link_type in field_name.lower():
-                                    card.add_link(link_type, value)
-                                    # Add reverse link
-                                    reverse_type = self._get_reverse_link_type(link_type)
-                                    if reverse_type:
-                                        self.cards[value].add_link(reverse_type, concept)
+                        if value in self.cards:
+                            card.add_link('related_pathology', value)
+                            self.cards[value].add_link('pathology_of', concept)
+                
+                elif 'process' in field_lower or 'participates' in field_lower:
+                    for value in values:
+                        if value in self.cards:
+                            card.add_link('participates_in_process', value)
+                            self.cards[value].add_link('has_participant', concept)
+                
+                # Standard within-domain links
+                for link_type in card.links:
+                    if link_type in field_lower:
+                        for value in values:
+                            if value in self.cards:
+                                card.add_link(link_type, value)
     
-    def _get_reverse_link_type(self, link_type: str) -> Optional[str]:
-        """Get the reverse link type"""
-        reverse_map = {
-            'superstructure': 'substructure',
-            'substructure': 'superstructure',
-            'superclass': 'subclass',
-            'subclass': 'superclass'
-        }
-        return reverse_map.get(link_type)
+    def get_cards_by_domain(self, domain_name: str) -> List[Flashcard]:
+        """Get all cards of a specific domain"""
+        return [self.cards[concept] for concept in self.domain_members.get(domain_name, set())]
     
-    def get_card(self, concept: str) -> Optional[Flashcard]:
-        """Get a specific flashcard by concept"""
-        return self.cards.get(concept)
-    
-    def get_incomplete_cards(self) -> List[Flashcard]:
-        """Get all cards with incomplete information"""
-        return [card for card in self.cards.values() if not card.is_complete()]
-    
-    def get_linked_cards(self, concept: str, link_type: Optional[str] = None) -> Dict[str, Set[str]]:
-        """Get all cards linked to a specific concept"""
-        card = self.get_card(concept)
+    def get_cross_domain_links(self, concept: str) -> Dict[str, List[tuple]]:
+        """Get all links that cross domain boundaries"""
+        card = self.cards.get(concept)
         if not card:
             return {}
         
-        if link_type:
-            return {link_type: card.links.get(link_type, set())}
-        return dict(card.links)
-    
-    def save_to_json(self, filepath: str):
-        """Save collection to JSON file"""
-        data = {
-            'cards': {concept: card.to_dict() for concept, card in self.cards.items()},
-            'field_names': list(self.field_names),
-            'link_types': list(self.link_types)
-        }
-        with open(filepath, 'w') as f:
-            json.dump(data, f, indent=2)
-    
-    def load_from_json(self, filepath: str):
-        """Load collection from JSON file"""
-        with open(filepath, 'r') as f:
-            data = json.load(f)
+        cross_links = {}
+        for link_type, targets in card.links.items():
+            for target in targets:
+                target_card = self.cards.get(target)
+                if target_card and target_card.domain.name != card.domain.name:
+                    if link_type not in cross_links:
+                        cross_links[link_type] = []
+                    cross_links[link_type].append((target, target_card.domain.name))
         
-        self.field_names = set(data['field_names'])
-        self.link_types = set(data['link_types'])
-        self.cards = {
-            concept: Flashcard.from_dict(card_data) 
-            for concept, card_data in data['cards'].items()
-        }
+        return cross_links
+    
+    def suggest_links(self, concept: str) -> Dict[str, List[str]]:
+        """Suggest potential links based on patterns"""
+        suggestions = {}
+        card = self.cards.get(concept)
+        if not card:
+            return suggestions
+        
+        # Example: if this is an anatomy card, suggest pathologies that might affect it
+        if card.domain.name == 'anatomy':
+            pathology_cards = self.get_cards_by_domain('pathology')
+            for path_card in pathology_cards:
+                # Check if pathology mentions this structure
+                for field_values in path_card.get_all_fields().values():
+                    for value in field_values:
+                        if concept.lower() in value.lower():
+                            suggestions.setdefault('potential_pathology', []).append(path_card.concept)
+        
+        return suggestions
