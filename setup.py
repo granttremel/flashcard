@@ -5,4 +5,11 @@ setup(name='flashcard',
       description='my flashcards',
       author='gront',
       packages=find_packages(),
+      install_requires=[
+          'beautifulsoup4',
+          'requests',
+          'networkx',
+          'matplotlib',
+          'numpy',
+      ],
      )

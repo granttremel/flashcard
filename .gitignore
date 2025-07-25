@@ -17,3 +17,5 @@ flash-2/
 *.code-workspace
 
 project-description.md
+
+data/*
